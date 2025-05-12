@@ -2,6 +2,7 @@
 train/COCO2017test
 train/Gustavosta-sample
 train/output*
+train/wandb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

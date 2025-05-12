@@ -13,12 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
+import sys
+
+sys.path.append("../")
+
 import argparse
+import json
 import logging
 import math
 import os
 import random
 import shutil
+import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import accelerate
@@ -26,7 +33,6 @@ import diffusers
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -40,15 +46,30 @@ from diffusers import (
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
+from diffusers.models.lora import (
+    LoRACompatibleConv,
+    LoRACompatibleLinear,
+    LoRAConv2dLayer,
+    LoRALinearLayer,
+)
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
+from safetensors.torch import load_file
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+
+from utils.lora_modules import (
+    CustomLoRACompatibleConvforward,
+    CustomLoRACompatibleLinearforward,
+    CustomLoRAConv2dLayerforward,
+    CustomLoRALinearLayerforward,
+)
+from utils.models import MapperNet, SecretDecoder, SecretEncoder
 
 if is_wandb_available():
     import wandb
@@ -70,8 +91,19 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
+@torch.inference_mode()
 def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step
+    vae,
+    text_encoder,
+    tokenizer,
+    unet,
+    controlnet,
+    mapper,
+    msgdecoder,
+    args,
+    accelerator,
+    weight_dtype,
+    step,
 ):
     logger.info("Running validation... ")
 
@@ -91,7 +123,7 @@ def log_validation(
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
+    pipeline.set_progress_bar_config(leave=False)
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
@@ -116,19 +148,27 @@ def log_validation(
         )
 
     image_logs = []
+    acc = []
 
     for validation_prompt, validation_image in zip(validation_prompts, validation_images):
         validation_image = Image.open(validation_image).convert("RGB")
 
+        secret_vectors = []
         images = []
 
         for _ in range(args.num_validation_images):
             with torch.autocast("cuda"):
+                secret_vector = torch.randint(0, 2, (1, args.msg_bits))
+                secret_vector = secret_vector.to(accelerator.device, dtype=torch.float)
+                secret_vectors.append(secret_vector)
+                mapped_loradiag = mapper(secret_vector).to(dtype=weight_dtype)
+
                 image = pipeline(
                     validation_prompt,
                     validation_image,
                     num_inference_steps=20,
                     generator=generator,
+                    cross_attention_kwargs={"scale": mapped_loradiag},
                 ).images[0]
 
             images.append(image)
@@ -141,12 +181,27 @@ def log_validation(
             }
         )
 
+        with torch.autocast("cuda"):
+            secret_vectors = torch.stack(secret_vectors)
+            np_images = np.stack([np.asarray(img) for img in images])
+            tensor_images = torch.from_numpy(np_images).to(accelerator.device, dtype=weight_dtype)
+            tensor_images = tensor_images.permute(0, 3, 1, 2)
+            tensor_images = tensor_images / 255 * 2 - 1
+            decoded_logits = msgdecoder(tensor_images)
+            decoded_messages = torch.argmax(decoded_logits, dim=-1)
+            valid_accuracy = ((secret_vectors - decoded_messages) == 0).float().mean().item()
+            acc.append(valid_accuracy)
+
+    acc = sum(acc) / len(acc)
+
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             for log in image_logs:
                 images = log["images"]
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
+
+                validation_image = validation_image.resize(images[0].size)
 
                 formatted_images = []
 
@@ -180,7 +235,7 @@ def log_validation(
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
-        return image_logs
+        return image_logs, acc
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -338,6 +393,18 @@ def parse_args(input_args=None):
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
+    )
+    parser.add_argument(
+        "--resume_from_lora",
+        type=str,
+        default=None,
+        help=("Whether training should be resumed from a trained lora."),
+    )
+    parser.add_argument(
+        "--start_from_pretrain",
+        type=str,
+        default=None,
+        help=("the path of the pretrained watermark model."),
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -511,12 +578,6 @@ def parse_args(input_args=None):
         help="The column of the dataset containing the target image.",
     )
     parser.add_argument(
-        "--conditioning_image_column",
-        type=str,
-        default="conditioning_image",
-        help="The column of the dataset containing the controlnet conditioning image.",
-    )
-    parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
@@ -585,6 +646,15 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=4,
+        help=("The dimension of the LoRA update matrices."),
+    )
+    parser.add_argument(
+        "--msg_bits", type=int, default=16, help="The number of bits of the hidden message."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -641,8 +711,10 @@ def make_train_dataset(args, tokenizer, accelerator):
         )
     else:
         if args.train_data_dir is not None:
+            data_files = {'train': os.path.join(args.train_data_dir, '**')}
             dataset = load_dataset(
-                args.train_data_dir,
+                'imagefolder',
+                data_files=data_files,
                 cache_dir=args.cache_dir,
             )
         # See more about loading custom images at
@@ -671,16 +743,6 @@ def make_train_dataset(args, tokenizer, accelerator):
         if caption_column not in column_names:
             raise ValueError(
                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
     def tokenize_captions(examples, is_train=True):
@@ -731,9 +793,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         images = [image.convert("RGB") for image in examples[image_column]]
         images = [image_transforms(image) for image in images]
 
-        conditioning_images = [
-            image.convert("RGB") for image in examples[conditioning_image_column]
-        ]
+        conditioning_images = [image.convert("RGB") for image in examples[image_column]]
         conditioning_images = [
             conditioning_image_transforms(image) for image in conditioning_images
         ]
@@ -845,7 +905,6 @@ def main(args):
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=args.revision,
-        variant=args.variant,
     )
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -866,6 +925,16 @@ def main(args):
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
+
+    sec_encoder = SecretEncoder(secret_len=args.msg_bits, resolution=64)
+    msgdecoder = SecretDecoder(output_size=args.msg_bits)
+    mapper = MapperNet(input_size=args.msg_bits, output_size=args.rank)
+    pretrain_dict = torch.load(args.start_from_pretrain)
+    sec_encoder.load_state_dict(pretrain_dict['sec_encoder'])
+    msgdecoder.load_state_dict(pretrain_dict['sec_decoder'])
+    if args.resume_from_lora is not None:
+        msgdecoder.load_state_dict(torch.load(args.resume_from_lora + "/msgdecoder.pt"))
+        mapper.load_state_dict(torch.load(args.resume_from_lora + "/mapper.pt"))
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -901,7 +970,12 @@ def main(args):
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    msgdecoder.requires_grad_(False)
     controlnet.train()
+    unet.eval()
+    sec_encoder.eval()
+    msgdecoder.eval()
+    mapper.eval()
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1008,10 +1082,108 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    # now we will add new LoRA weights to the attention layers
+    # It's important to realize here how many attention weights will be added and of which sizes
+    # The sizes of the attention layers consist only of two different variables:
+    # 1) - the "hidden_size", which is increased according to `unet.config.block_out_channels`.
+    # 2) - the "cross attention size", which is set to `unet.config.cross_attention_dim`.
+
+    # Let's first see how many attention processors we will have to set.
+    # For Stable Diffusion, it should be equal to:
+    # - down blocks (2x attention layers) * (2x transformer layers) * (3x down blocks) = 12
+    # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
+    # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
+    # => 32 layers
+
+    # Set correct lora layers
+    with open('../utils/unet_keys.json') as f:
+        unet_keys = json.load(f)
+
+    lora_layers_list = []
+
+    if args.resume_from_lora is not None:
+        value_dict = load_file(args.resume_from_lora + "/pytorch_lora_weights.safetensors")
+        value_dict = {k.replace("lora.", ""): v for k, v in value_dict.items()}
+        value_dict = {k.replace(".processor.", "."): v for k, v in value_dict.items()}
+        value_dict = {k.replace("unet.", ""): v for k, v in value_dict.items()}
+        value_dict = {k.replace("_down.", ".down."): v for k, v in value_dict.items()}
+        value_dict = {k.replace("_up.", ".up."): v for k, v in value_dict.items()}
+        value_dict = {k.replace(".to_out.", ".to_out.0."): v for k, v in value_dict.items()}
+
+    for key in unet_keys:
+        attn_processor = unet
+        for sub_key in key.split("."):
+            attn_processor = getattr(attn_processor, sub_key)
+
+        # Process non-attention layers, which don't have to_{k,v,q,out_proj}_lora layers
+        # or add_{k,v,q,out_proj}_proj_lora layers.
+        rank = args.rank
+
+        if isinstance(attn_processor, LoRACompatibleConv):
+            in_features = attn_processor.in_channels
+            out_features = attn_processor.out_channels
+            kernel_size = attn_processor.kernel_size
+
+            ctx = nullcontext
+            with ctx():
+                lora = LoRAConv2dLayer(
+                    in_features=in_features,
+                    out_features=out_features,
+                    rank=rank,
+                    kernel_size=kernel_size,
+                    stride=attn_processor.stride,
+                    padding=attn_processor.padding,
+                ).to(weight_dtype)
+        elif isinstance(attn_processor, LoRACompatibleLinear):
+            ctx = nullcontext
+            with ctx():
+                lora = LoRALinearLayer(
+                    attn_processor.in_features,
+                    attn_processor.out_features,
+                    rank,
+                ).to(weight_dtype)
+        else:
+            raise ValueError(
+                f"Module {key} is not a LoRACompatibleConv or LoRACompatibleLinear module."
+            )
+
+        if args.resume_from_lora is not None:
+            lora.load_state_dict(
+                {
+                    'down.weight': value_dict[key + '.down.weight'],
+                    'up.weight': value_dict[key + '.up.weight'],
+                }
+            )
+        lora_layers_list.append((attn_processor, lora))
+
+    unet_lora_parameters = []
+    # set lora layers
+    for target_module, lora_layer in lora_layers_list:
+        target_module.set_lora_layer(lora_layer)
+        unet_lora_parameters.extend(lora_layer.parameters())
+
+    # George: monkey-patch the forward passes of lora layers in unet
+    for name, module in unet.named_modules():
+        if isinstance(module, LoRACompatibleConv):
+            module.forward = types.MethodType(CustomLoRACompatibleConvforward, module)
+            if module.lora_layer is not None:
+                module.lora_layer.forward = types.MethodType(
+                    CustomLoRAConv2dLayerforward, module.lora_layer
+                )
+        elif isinstance(module, LoRACompatibleLinear):
+            module.forward = types.MethodType(CustomLoRACompatibleLinearforward, module)
+            if module.lora_layer is not None:
+                module.lora_layer.forward = types.MethodType(
+                    CustomLoRALinearLayerforward, module.lora_layer
+                )
+
     # Move vae, unet and text_encoder to device and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    sec_encoder.to(accelerator.device)
+    msgdecoder.to(accelerator.device)
+    mapper.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -1087,9 +1259,14 @@ def main(args):
     )
 
     image_logs = None
+    acc = 0
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
+                secret_vector = torch.randint(0, 2, (args.train_batch_size, args.msg_bits))
+                secret_vector = secret_vector.to(accelerator.device, dtype=torch.float)
+                mapped_loradiag = mapper(secret_vector).to(dtype=weight_dtype)
+
                 # Convert images to latent space
                 latents = vae.encode(
                     batch["pixel_values"].to(dtype=weight_dtype)
@@ -1117,20 +1294,23 @@ def main(args):
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=controlnet_image,
+                    encoder_hidden_states,
+                    controlnet_image,
                     return_dict=False,
                 )
 
                 # Predict the noise residual
+                down_block_additional_residuals = [
+                    sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                ]
+                mid_block_additional_residual = mid_block_res_sample.to(dtype=weight_dtype)
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                    encoder_hidden_states,
+                    cross_attention_kwargs={"scale": mapped_loradiag},
+                    down_block_additional_residuals=down_block_additional_residuals,
+                    mid_block_additional_residual=mid_block_additional_residual,
                 ).sample
 
                 # Get the target for loss depending on the prediction type
@@ -1191,19 +1371,21 @@ def main(args):
                         args.validation_prompt is not None
                         and global_step % args.validation_steps == 0
                     ):
-                        image_logs = log_validation(
+                        image_logs, acc = log_validation(
                             vae,
                             text_encoder,
                             tokenizer,
                             unet,
                             controlnet,
+                            mapper,
+                            msgdecoder,
                             args,
                             accelerator,
                             weight_dtype,
                             global_step,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "acc": acc}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
