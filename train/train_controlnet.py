@@ -1132,7 +1132,10 @@ def main(args):
                 alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
                 beta_prod_t = 1 - alpha_prod_t
                 pred_x0 = (noisy_latents - beta_prod_t**0.5 * model_pred) / alpha_prod_t**0.5
-                loss_x0 = F.l1_loss(pred_x0.float(), latents.float(), reduction="mean")
+                loss_x0 = F.l1_loss(pred_x0.float(), latents.float(), reduction="none")
+                # weight为timesteps从1000到0映射到1到e的log函数
+                weight_loss_x0 = torch.log((1000 - timesteps) / 1000 * (torch.e - 1) + 1)
+                loss_x0 = torch.mean(weight_loss_x0[:, None, None, None] * loss_x0)
 
                 loss = loss_noise + loss_x0
 
