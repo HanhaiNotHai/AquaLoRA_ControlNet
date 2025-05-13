@@ -147,6 +147,8 @@ def log_validation(
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
 
+                validation_image = validation_image.resize(images[0].size)
+
                 formatted_images = []
 
                 formatted_images.append(np.asarray(validation_image))
@@ -510,12 +512,6 @@ def parse_args(input_args=None):
         help="The column of the dataset containing the target image.",
     )
     parser.add_argument(
-        "--conditioning_image_column",
-        type=str,
-        default="conditioning_image",
-        help="The column of the dataset containing the controlnet conditioning image.",
-    )
-    parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
@@ -640,8 +636,10 @@ def make_train_dataset(args, tokenizer, accelerator):
         )
     else:
         if args.train_data_dir is not None:
+            data_files = {'train': os.path.join(args.train_data_dir, '**')}
             dataset = load_dataset(
-                args.train_data_dir,
+                'imagefolder',
+                data_files=data_files,
                 cache_dir=args.cache_dir,
             )
         # See more about loading custom images at
@@ -670,16 +668,6 @@ def make_train_dataset(args, tokenizer, accelerator):
         if caption_column not in column_names:
             raise ValueError(
                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
     def tokenize_captions(examples, is_train=True):
@@ -730,9 +718,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         images = [image.convert("RGB") for image in examples[image_column]]
         images = [image_transforms(image) for image in images]
 
-        conditioning_images = [
-            image.convert("RGB") for image in examples[conditioning_image_column]
-        ]
+        conditioning_images = [image.convert("RGB") for image in examples[image_column]]
         conditioning_images = [
             conditioning_image_transforms(image) for image in conditioning_images
         ]
@@ -837,14 +823,13 @@ def main(args):
     )
 
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(
+    noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
     text_encoder = text_encoder_cls.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=args.revision,
-        variant=args.variant,
     )
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -1141,7 +1126,15 @@ def main(args):
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss_noise = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+                alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
+                beta_prod_t = 1 - alpha_prod_t
+                pred_x0 = (noisy_latents - beta_prod_t**0.5 * model_pred) / alpha_prod_t**0.5
+                loss_x0 = F.l1_loss(pred_x0.float(), latents.float(), reduction="mean")
+
+                loss = loss_noise + loss_x0
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1202,7 +1195,12 @@ def main(args):
                             global_step,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                'loss_noise': loss_noise.detach().item(),
+                'loss_x0': loss_x0.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
