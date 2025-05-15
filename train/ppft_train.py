@@ -1,62 +1,66 @@
 # Modified from Huggingface's diffusers repo
 
 import sys
+
 sys.path.append("../")
+
 import argparse
 import copy
-import random
 import itertools
+import json
 import logging
 import math
 import os
+import random
 import shutil
-import json
+import types
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict
-from tqdm.auto import tqdm
-from PIL import Image
-from packaging import version
-from contextlib import nullcontext
-import types
 
+import diffusers
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
-from torchvision import transforms
-from torch.utils.data import Dataset
-from safetensors.torch import load_file
-
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from transformers import AutoTokenizer, PretrainedConfig
-import diffusers
 from diffusers import (
     AutoencoderKL,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
     UNet2DConditionModel,
 )
-from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.models.lora import (
+    LoRACompatibleConv,
+    LoRACompatibleLinear,
+    LoRAConv2dLayer,
+    LoRALinearLayer,
+)
+from diffusers.utils import is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.models.lora import LoRALinearLayer, LoRAConv2dLayer, LoRACompatibleConv, LoRACompatibleLinear
+from packaging import version
+from PIL import Image
+from safetensors.torch import load_file
+from torchvision import transforms
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, PretrainedConfig
 
 from utils.cschedulers import customDDPMScheduler
 from utils.lora_modules import (
-    CustomLoraLoaderMixin,
-    CustomLoRALinearLayerforward,
-    CustomLoRAConv2dLayerforward,
     CustomLoRACompatibleConvforward,
     CustomLoRACompatibleLinearforward,
+    CustomLoRAConv2dLayerforward,
+    CustomLoRALinearLayerforward,
+    CustomLoraLoaderMixin,
 )
 from utils.misc import get_cosine_schedule_with_warmup_lr_end
-from utils.models import SecretEncoder, SecretDecoder, MapperNet
+from utils.models import MapperNet, SecretDecoder, SecretEncoder
 
 logger = get_logger(__name__)
+
 
 def text_encoder_all_modules(text_encoder):
     all_modules = []
@@ -66,6 +70,7 @@ def text_encoder_all_modules(text_encoder):
         mlp_mod = layer.mlp
         all_modules.append((name, attn_mod, mlp_mod))
     return all_modules
+
 
 def text_encoder_lora_state_dict(text_encoder):
     state_dict = {}
@@ -90,6 +95,7 @@ def text_encoder_lora_state_dict(text_encoder):
 
     return state_dict
 
+
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path,
@@ -103,7 +109,9 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 
         return CLIPTextModel
     elif model_class == "RobertaSeriesModelWithTransformation":
-        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import (
+            RobertaSeriesModelWithTransformation,
+        )
 
         return RobertaSeriesModelWithTransformation
     elif model_class == "T5EncoderModel":
@@ -112,6 +120,7 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         return T5EncoderModel
     else:
         raise ValueError(f"{model_class} is not supported.")
+
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -168,7 +177,10 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+        "--image_column",
+        type=str,
+        default="image",
+        help="The column of the dataset containing an image.",
     )
     parser.add_argument(
         "--caption_column",
@@ -234,7 +246,10 @@ def parse_args(input_args=None):
         help="Whether to train the text encoder. If set, the text encoder should be float32 precision.",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size",
+        type=int,
+        default=4,
+        help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -272,17 +287,13 @@ def parse_args(input_args=None):
         "--resume_from_lora",
         type=str,
         default=None,
-        help=(
-            "Whether training should be resumed from a trained lora."
-        ),
+        help=("Whether training should be resumed from a trained lora."),
     )
     parser.add_argument(
         "--start_from_pretrain",
         type=str,
         default=None,
-        help=(
-            "the path of the pretrained watermark model."
-        ),
+        help=("the path of the pretrained watermark model."),
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -317,7 +328,10 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps",
+        type=int,
+        default=500,
+        help="Number of steps for the warmup in the lr scheduler.",
     )
     parser.add_argument(
         "--lr_end", type=float, default=0.0, help="The end learning rate for the lr scheduler."
@@ -328,7 +342,9 @@ def parse_args(input_args=None):
         default=1,
         help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
     )
-    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
+    parser.add_argument(
+        "--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler."
+    )
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -338,12 +354,25 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+        "--use_8bit_adam",
+        action="store_true",
+        help="Whether or not to use 8-bit Adam from bitsandbytes.",
     )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument(
+        "--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer."
+    )
+    parser.add_argument(
+        "--adam_beta2",
+        type=float,
+        default=0.999,
+        help="The beta2 parameter for the Adam optimizer.",
+    )
+    parser.add_argument(
+        "--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use."
+    )
+    parser.add_argument(
+        "--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer"
+    )
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument(
         "--logging_dir",
@@ -382,9 +411,13 @@ def parse_args(input_args=None):
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+        "--local_rank", type=int, default=-1, help="For distributed training: local_rank"
+    )
+    parser.add_argument(
+        "--enable_xformers_memory_efficient_attention",
+        action="store_true",
+        help="Whether or not to use xformers.",
     )
     parser.add_argument(
         "--text_encoder_use_attention_mask",
@@ -411,7 +444,9 @@ def parse_args(input_args=None):
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
-    parser.add_argument("--msg_bits", type=int, default=48, help="The number of bits of the hidden message.")
+    parser.add_argument(
+        "--msg_bits", type=int, default=48, help="The number of bits of the hidden message."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -423,6 +458,7 @@ def parse_args(input_args=None):
         args.local_rank = env_local_rank
 
     return args
+
 
 def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_attention_mask=None):
     text_input_ids = input_ids.to(text_encoder.device)
@@ -439,6 +475,7 @@ def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_atte
     prompt_embeds = prompt_embeds[0]
 
     return prompt_embeds
+
 
 def unet_attn_processors_state_dict(unet) -> Dict[str, torch.tensor]:
     r"""
@@ -460,10 +497,10 @@ def unet_attn_processors_state_dict(unet) -> Dict[str, torch.tensor]:
                 parameter_key = parameter_key.replace('lora_layer.', '')
                 _key = key.replace('.proj_in', '.proj_in.lora')
                 _key = _key.replace('.proj_out', '.proj_out.lora')
-                _key = _key.replace('.to_q','.processor.to_q_lora')
-                _key = _key.replace('.to_k','.processor.to_k_lora')
-                _key = _key.replace('.to_v','.processor.to_v_lora')
-                _key = _key.replace('.to_out.0','.processor.to_out_lora')
+                _key = _key.replace('.to_q', '.processor.to_q_lora')
+                _key = _key.replace('.to_k', '.processor.to_k_lora')
+                _key = _key.replace('.to_v', '.processor.to_v_lora')
+                _key = _key.replace('.to_out.0', '.processor.to_out_lora')
                 if 'ff' in _key:
                     _key = _key + '.lora'
                 attn_processors_state_dict[f"{_key}.{parameter_key}"] = parameter
@@ -474,7 +511,9 @@ def unet_attn_processors_state_dict(unet) -> Dict[str, torch.tensor]:
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=args.output_dir, logging_dir=logging_dir
+    )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -485,13 +524,19 @@ def main(args):
 
     if args.report_to == "wandb":
         if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+            raise ImportError(
+                "Make sure to install wandb if you want to use it for logging during training."
+            )
         import wandb
 
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
     # TODO (sayakpaul): Remove this check when gradient accumulation with two models is enabled in accelerate.
-    if args.train_text_encoder and args.gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
+    if (
+        args.train_text_encoder
+        and args.gradient_accumulation_steps > 1
+        and accelerator.num_processes > 1
+    ):
         raise ValueError(
             "Gradient accumulation is not supported when training the text encoder in distributed training. "
             "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
@@ -522,7 +567,9 @@ def main(args):
 
     # Load the tokenizer
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name, revision=args.revision, use_fast=False
+        )
     elif args.pretrained_model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -532,10 +579,14 @@ def main(args):
         )
 
     # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+    text_encoder_cls = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision
+    )
 
     # Load scheduler and models
-    noise_scheduler = customDDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = customDDPMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
     text_encoder = text_encoder_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
@@ -579,12 +630,6 @@ def main(args):
     msgdecoder.to(accelerator.device)
     mapper.to(accelerator.device)
     sec_encoder.to(accelerator.device)
-
-    def decode_latents(latents):
-        latents = 1 / vae.config.scaling_factor * latents
-        image = vae.decode(latents).sample
-        # image = image / 2 + 0.5
-        return image
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -665,10 +710,17 @@ def main(args):
                     rank,
                 )
         else:
-            raise ValueError(f"Module {key} is not a LoRACompatibleConv or LoRACompatibleLinear module.")
+            raise ValueError(
+                f"Module {key} is not a LoRACompatibleConv or LoRACompatibleLinear module."
+            )
 
         if args.resume_from_lora is not None:
-            lora.load_state_dict({'down.weight':value_dict[key+'.down.weight'], 'up.weight':value_dict[key+'.up.weight']})
+            lora.load_state_dict(
+                {
+                    'down.weight': value_dict[key + '.down.weight'],
+                    'up.weight': value_dict[key + '.up.weight'],
+                }
+            )
         lora_layers_list.append((attn_processor, lora))
 
     unet_lora_parameters = []
@@ -682,18 +734,23 @@ def main(args):
         if isinstance(module, LoRACompatibleConv):
             module.forward = types.MethodType(CustomLoRACompatibleConvforward, module)
             if module.lora_layer is not None:
-                module.lora_layer.forward = types.MethodType(CustomLoRAConv2dLayerforward, module.lora_layer)
+                module.lora_layer.forward = types.MethodType(
+                    CustomLoRAConv2dLayerforward, module.lora_layer
+                )
         elif isinstance(module, LoRACompatibleLinear):
             module.forward = types.MethodType(CustomLoRACompatibleLinearforward, module)
             if module.lora_layer is not None:
-                module.lora_layer.forward = types.MethodType(CustomLoRALinearLayerforward, module.lora_layer)
-
+                module.lora_layer.forward = types.MethodType(
+                    CustomLoRALinearLayerforward, module.lora_layer
+                )
 
     # The text encoder comes from 🤗 transformers, so we cannot directly modify it.
     # So, instead, we monkey-patch the forward calls of its attention-blocks.
     if args.train_text_encoder:
         # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
-        text_lora_parameters = CustomLoraLoaderMixin._modify_text_encoder(text_encoder, dtype=torch.float32, rank=args.rank, patch_mlp=True)
+        text_lora_parameters = CustomLoraLoaderMixin._modify_text_encoder(
+            text_encoder, dtype=torch.float32, rank=args.rank, patch_mlp=True
+        )
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -739,7 +796,9 @@ def main(args):
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
         lora_state_dict, network_alphas = CustomLoraLoaderMixin.lora_state_dict(input_dir)
-        CustomLoraLoaderMixin.load_lora_into_unet(lora_state_dict, network_alphas=network_alphas, unet=unet_)
+        CustomLoraLoaderMixin.load_lora_into_unet(
+            lora_state_dict, network_alphas=network_alphas, unet=unet_
+        )
         CustomLoraLoaderMixin.load_lora_into_text_encoder(
             lora_state_dict, network_alphas=network_alphas, text_encoder=text_encoder_
         )
@@ -754,7 +813,10 @@ def main(args):
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+            args.learning_rate
+            * args.gradient_accumulation_steps
+            * args.train_batch_size
+            * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -846,7 +908,11 @@ def main(args):
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
         inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            captions,
+            max_length=tokenizer.model_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
         )
         return inputs.input_ids, inputs.attention_mask
 
@@ -854,7 +920,11 @@ def main(args):
     train_transforms = transforms.Compose(
         [
             transforms.Resize((args.resolution, args.resolution)),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            (
+                transforms.RandomHorizontalFlip()
+                if args.random_flip
+                else transforms.Lambda(lambda x: x)
+            ),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
@@ -874,7 +944,11 @@ def main(args):
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
         attention_mask = torch.stack([example["attention_mask"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids, "attention_mask": attention_mask}
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -888,7 +962,9 @@ def main(args):
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -900,11 +976,12 @@ def main(args):
         lr_end=args.lr_end,
     )
 
-
     # Prepare everything with our `accelerator`.
     if args.train_text_encoder:
-        mapper, msgdecoder, unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            mapper, msgdecoder, unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        mapper, msgdecoder, unet, text_encoder, optimizer, train_dataloader, lr_scheduler = (
+            accelerator.prepare(
+                mapper, msgdecoder, unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+            )
         )
     else:
         mapper, msgdecoder, unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -912,7 +989,9 @@ def main(args):
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -926,14 +1005,18 @@ def main(args):
         accelerator.init_trackers("text2image-lora", config=tracker_config)
 
     # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = (
+        args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
@@ -962,10 +1045,14 @@ def main(args):
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+            resume_step = resume_global_step % (
+                num_update_steps_per_epoch * args.gradient_accumulation_steps
+            )
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(
+        range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process
+    )
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
@@ -986,7 +1073,11 @@ def main(args):
 
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-                init_secret_vector = torch.randint(0, 2, (args.train_batch_size, args.msg_bits)).float().to(accelerator.device)
+                init_secret_vector = (
+                    torch.randint(0, 2, (args.train_batch_size, args.msg_bits))
+                    .float()
+                    .to(accelerator.device)
+                )
                 mapped_loradiag = mapper(init_secret_vector).to(dtype=weight_dtype)
 
                 # Convert images to latent space
@@ -1000,15 +1091,15 @@ def main(args):
                 noise = torch.randn_like(model_input)
                 bsz, channels, height, width = model_input.shape
                 # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, 1000, (bsz,), device=model_input.device
-                )
+                timesteps = torch.randint(0, 1000, (bsz,), device=model_input.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
-                noisy_wm_model_input = noise_scheduler.add_noise(model_input + wm_latent, noise, timesteps)
+                noisy_wm_model_input = noise_scheduler.add_noise(
+                    model_input + wm_latent, noise, timesteps
+                )
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = encode_prompt(
@@ -1024,14 +1115,20 @@ def main(args):
                     class_labels = None
 
                 clean_pred = unet(
-                    noisy_model_input, timesteps, encoder_hidden_states, class_labels=class_labels,
-                    cross_attention_kwargs={"scale": torch.zeros_like(mapped_loradiag)}
+                    noisy_model_input,
+                    timesteps,
+                    encoder_hidden_states,
+                    class_labels=class_labels,
+                    cross_attention_kwargs={"scale": torch.zeros_like(mapped_loradiag)},
                 ).sample.detach()
 
                 # Predict the noise residual
                 model_pred = unet(
-                    noisy_wm_model_input, timesteps, encoder_hidden_states, class_labels=class_labels,
-                    cross_attention_kwargs={"scale": mapped_loradiag}
+                    noisy_wm_model_input,
+                    timesteps,
+                    encoder_hidden_states,
+                    class_labels=class_labels,
+                    cross_attention_kwargs={"scale": mapped_loradiag},
                 ).sample
                 model_pred = model_pred.to(dtype=weight_dtype)
 
@@ -1044,9 +1141,15 @@ def main(args):
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = clean_pred
-                elif noise_scheduler.config.prediction_type == "v_prediction": # for SD2, use v_prediction
-                    model_pred = noise_scheduler.velocity_to_eplison(model_pred, noisy_wm_model_input, timesteps)
-                    target = noise_scheduler.velocity_to_eplison(clean_pred, noisy_model_input, timesteps)
+                elif (
+                    noise_scheduler.config.prediction_type == "v_prediction"
+                ):  # for SD2, use v_prediction
+                    model_pred = noise_scheduler.velocity_to_eplison(
+                        model_pred, noisy_wm_model_input, timesteps
+                    )
+                    target = noise_scheduler.velocity_to_eplison(
+                        clean_pred, noisy_model_input, timesteps
+                    )
 
                 ppftloss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 loss = ppftloss
@@ -1092,10 +1195,14 @@ def main(args):
                                 logger.info(
                                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                logger.info(
+                                    f"removing checkpoints: {', '.join(removing_checkpoints)}"
+                                )
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    removing_checkpoint = os.path.join(
+                                        args.output_dir, removing_checkpoint
+                                    )
                                     shutil.rmtree(removing_checkpoint)
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
@@ -1124,7 +1231,7 @@ def main(args):
                     text_encoder=accelerator.unwrap_model(text_encoder),
                     revision=args.revision,
                     torch_dtype=weight_dtype,
-                    safety_checker=None
+                    safety_checker=None,
                 )
 
                 # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
@@ -1146,12 +1253,21 @@ def main(args):
                 pipeline.set_progress_bar_config(disable=True)
 
                 with torch.no_grad():
-                    eval_secret_vector = torch.randint(0, 2, (1, args.msg_bits)).to(accelerator.device)
+                    eval_secret_vector = torch.randint(0, 2, (1, args.msg_bits)).to(
+                        accelerator.device
+                    )
                     eval_secret_vector_ = eval_secret_vector.float()
                     # run inference
-                    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
+                    generator = (
+                        torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                        if args.seed
+                        else None
+                    )
                     mapped_loradiag = mapper(eval_secret_vector_).to(dtype=weight_dtype)
-                    pipeline_args = {"prompt": args.validation_prompt, "cross_attention_kwargs":{"scale": mapped_loradiag}}
+                    pipeline_args = {
+                        "prompt": args.validation_prompt,
+                        "cross_attention_kwargs": {"scale": mapped_loradiag},
+                    }
 
                     if args.validation_images is None:
                         images = []
@@ -1164,12 +1280,16 @@ def main(args):
                         for image in args.validation_images:
                             image = Image.open(image)
                             with torch.cuda.amp.autocast():
-                                image = pipeline(**pipeline_args, image=image, generator=generator).images[0]
+                                image = pipeline(
+                                    **pipeline_args, image=image, generator=generator
+                                ).images[0]
                             images.append(image)
 
                     # decode messages
                     np_images = np.stack([np.asarray(img) for img in images])
-                    tensor_images = torch.from_numpy(np_images).to(accelerator.device, dtype=weight_dtype)
+                    tensor_images = torch.from_numpy(np_images).to(
+                        accelerator.device, dtype=weight_dtype
+                    )
 
                     tensor_images = tensor_images.permute(0, 3, 1, 2)
                     tensor_images = tensor_images / 127.5 - 1
@@ -1177,16 +1297,21 @@ def main(args):
                     decoded_messages = msgdecoder(tensor_images.float())
                     # calulate accuracy
                     decoded_messages = torch.argmax(decoded_messages, dim=-1)
-                    res = eval_secret_vector.repeat(decoded_messages.shape[0],1) - decoded_messages
+                    res = (
+                        eval_secret_vector.repeat(decoded_messages.shape[0], 1) - decoded_messages
+                    )
                     valid_accuracy = (res == 0).float().mean()
-                    accelerator.log({"validation_accuracy": valid_accuracy.item()}, step=global_step)
+                    accelerator.log(
+                        {"validation_accuracy": valid_accuracy.item()}, step=global_step
+                    )
                     print(f"validation accuracy: {valid_accuracy.item()}")
-
 
                 for tracker in accelerator.trackers:
                     if tracker.name == "tensorboard":
                         np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                        tracker.writer.add_images(
+                            "validation", np_images, epoch, dataformats="NHWC"
+                        )
                     if tracker.name == "wandb":
                         tracker.log(
                             {
@@ -1231,7 +1356,10 @@ def main(args):
         # Final inference
         # Load previous pipeline
         pipeline = DiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=weight_dtype, safety_checker=None
+            args.pretrained_model_name_or_path,
+            revision=args.revision,
+            torch_dtype=weight_dtype,
+            safety_checker=None,
         )
 
         # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
@@ -1245,7 +1373,9 @@ def main(args):
 
             scheduler_args["variance_type"] = variance_type
 
-        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config, **scheduler_args)
+        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipeline.scheduler.config, **scheduler_args
+        )
 
         pipeline = pipeline.to(accelerator.device)
 
@@ -1255,9 +1385,15 @@ def main(args):
         # run inference
         images = []
         if args.validation_prompt and args.num_validation_images > 0:
-            generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
+            generator = (
+                torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                if args.seed
+                else None
+            )
             images = [
-                pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
+                pipeline(
+                    args.validation_prompt, num_inference_steps=25, generator=generator
+                ).images[0]
                 for _ in range(args.num_validation_images)
             ]
 
