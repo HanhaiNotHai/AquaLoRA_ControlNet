@@ -1,10 +1,11 @@
 accelerate launch --mixed_precision="fp16" train_controlnet.py \
  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+ --image_encoder_path="laion/CLIP-ViT-H-14-laion2B-s32B-b79K" \
  --output_dir="output_train_controlnet" \
- --train_batch_size=32 \
- --num_train_epochs=30 \
+ --train_batch_size=16 \
+ --num_train_epochs=20 \
  --checkpointing_steps=500 \
- --learning_rate=1e-5 \
+ --learning_rate=1e-4 \
  --lr_scheduler="constant" \
  --report_to="wandb" \
  --train_data_dir="Gustavosta-sample" \
