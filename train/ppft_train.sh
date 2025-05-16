@@ -1,0 +1,20 @@
+accelerate launch --mixed_precision="fp16" ppft_train.py \
+  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+  --train_data_dir="Gustavosta-sample" \
+  --validation_prompt="A portrait of a young white woman, masterpiece" \
+  --num_validation_images=4 \
+  --validation_epochs=1 \
+  --output_dir="output2" \
+  --seed=2048 \
+  --train_batch_size=20 \
+  --num_train_epochs=30 \
+  --checkpointing_steps=500 \
+  --start_from_pretrain="../AquaLoRA-Models/pretrained_latent_watermark/pretained_latentwm.pth" \
+  --learning_rate=1e-04 \
+  --lr_scheduler="cosine_with_restarts" \
+  --lr_warmup_steps=0 \
+  --lr_end=0.01 \
+  --report_to="wandb" \
+  --rank=320 \
+  --msg_bits=48 \
+ >ppft_train.log 2>&1
