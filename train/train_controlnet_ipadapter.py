@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+import itertools
 import logging
 import math
 import os
@@ -43,14 +44,28 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
+from ip_adapter.ip_adapter import ImageProjModel
+from ip_adapter.utils import is_torch2_available
 from packaging import version
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import (
+    AutoTokenizer,
+    CLIPImageProcessor,
+    CLIPVisionModelWithProjection,
+    PretrainedConfig,
+)
 
 if is_wandb_available():
     import wandb
+
+if is_torch2_available():
+    from ip_adapter.attention_processor import AttnProcessor2_0 as AttnProcessor
+    from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor
+else:
+    from ip_adapter.attention_processor import AttnProcessor, IPAttnProcessor
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0")
@@ -70,25 +85,37 @@ def image_grid(imgs, rows, cols):
 
 
 def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step
+    vae,
+    text_encoder,
+    tokenizer,
+    unet,
+    controlnet,
+    image_encoder,
+    args,
+    accelerator,
+    weight_dtype,
+    step,
 ):
     logger.info("Running validation... ")
 
     controlnet = accelerator.unwrap_model(controlnet)
 
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        controlnet=controlnet,
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
+    pipeline: StableDiffusionControlNetPipeline = (
+        StableDiffusionControlNetPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            controlnet=controlnet,
+            safety_checker=None,
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=weight_dtype,
+        )
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline.image_encoder = image_encoder
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
@@ -128,6 +155,7 @@ def log_validation(
                     validation_image,
                     num_inference_steps=20,
                     generator=generator,
+                    ip_adapter_image=validation_image,
                 ).images[0]
 
             images.append(image)
@@ -258,6 +286,19 @@ def parse_args(input_args=None):
         default=None,
         help="Path to pretrained controlnet model or model identifier from huggingface.co/models."
         " If not specified controlnet weights are initialized from unet.",
+    )
+    parser.add_argument(
+        "--pretrained_ip_adapter_path",
+        type=str,
+        default=None,
+        help="Path to pretrained ip adapter model. If not specified weights are initialized randomly.",
+    )
+    parser.add_argument(
+        "--image_encoder_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to CLIP image encoder",
     )
     parser.add_argument(
         "--revision",
@@ -574,7 +615,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="train_controlnet",
+        default="train_controlnet_ipadapter",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -714,6 +755,8 @@ def make_train_dataset(args, tokenizer, accelerator):
         ]
     )
 
+    clip_image_processor = CLIPImageProcessor()
+
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         images = [image_transforms(image) for image in images]
@@ -723,8 +766,14 @@ def make_train_dataset(args, tokenizer, accelerator):
             conditioning_image_transforms(image) for image in conditioning_images
         ]
 
+        clip_images = [
+            clip_image_processor(images=image, return_tensors="pt").pixel_values
+            for image in examples[image_column]
+        ]
+
         examples["pixel_values"] = images
         examples["conditioning_pixel_values"] = conditioning_images
+        examples["clip_images"] = clip_images
         examples["input_ids"] = tokenize_captions(examples)
 
         return examples
@@ -751,13 +800,104 @@ def collate_fn(examples):
         memory_format=torch.contiguous_format
     ).float()
 
+    clip_images = torch.cat([example["clip_images"] for example in examples])
+    clip_images = clip_images.to(memory_format=torch.contiguous_format).float()
+
     input_ids = torch.stack([example["input_ids"] for example in examples])
 
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
+        "clip_images": clip_images,
         "input_ids": input_ids,
     }
+
+
+class IPAdapter(torch.nn.Module):
+    """IP-Adapter"""
+
+    def __init__(
+        self,
+        unet: UNet2DConditionModel,
+        image_proj_model: ImageProjModel,
+        adapter_modules: torch.nn.ModuleList,
+        ckpt_path: str | None = None,
+    ):
+        super().__init__()
+        unet.encoder_hid_proj = image_proj_model
+        unet.config.encoder_hid_dim_type = 'ip_image_proj'
+        self.unet = unet
+        self.image_proj_model = image_proj_model
+        self.adapter_modules = adapter_modules
+
+        if ckpt_path is not None:
+            self.load_from_checkpoint(ckpt_path)
+
+    def forward(
+        self,
+        noisy_latents,
+        timesteps,
+        encoder_hidden_states,
+        image_embeds,
+        down_block_res_samples,
+        mid_block_res_sample,
+        weight_dtype,
+    ):
+        # ip_tokens = self.image_proj_model(image_embeds)
+        # encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
+        down_block_additional_residuals = [
+            sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+        ]
+        mid_block_additional_residual = mid_block_res_sample.to(dtype=weight_dtype)
+        # Predict the noise residual
+        noise_pred = self.unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states,
+            added_cond_kwargs={"image_embeds": image_embeds},
+            down_block_additional_residuals=down_block_additional_residuals,
+            mid_block_additional_residual=mid_block_additional_residual,
+        ).sample
+        return noise_pred
+
+    def load_from_checkpoint(self, ckpt_path: str):
+        # Calculate original checksums
+        orig_ip_proj_sum = torch.sum(
+            torch.stack([torch.sum(p) for p in self.image_proj_model.parameters()])
+        )
+        orig_adapter_sum = torch.sum(
+            torch.stack([torch.sum(p) for p in self.adapter_modules.parameters()])
+        )
+
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+
+        # Load state dict for image_proj_model and adapter_modules
+        self.image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+        self.adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
+
+        # Calculate new checksums
+        new_ip_proj_sum = torch.sum(
+            torch.stack([torch.sum(p) for p in self.image_proj_model.parameters()])
+        )
+        new_adapter_sum = torch.sum(
+            torch.stack([torch.sum(p) for p in self.adapter_modules.parameters()])
+        )
+
+        # Verify if the weights have changed
+        assert orig_ip_proj_sum != new_ip_proj_sum, "Weights of image_proj_model did not change!"
+        assert orig_adapter_sum != new_adapter_sum, "Weights of adapter_modules did not change!"
+
+        print(f"Successfully loaded weights from checkpoint {ckpt_path}")
+
+    def save_pretrained(self, save_directory):
+        os.makedirs(save_directory, exist_ok=True)
+        state_dict = {
+            'image_proj': self.image_proj_model.state_dict(),
+            'ip_adapter': self.adapter_modules.state_dict(),
+        }
+        f = os.path.join(save_directory, 'ip_adapter.bin')
+        torch.save(state_dict, f)
+        print(f'IP-Adapter weights saved in {f}')
 
 
 def main(args):
@@ -844,12 +984,54 @@ def main(args):
         variant=args.variant,
     )
 
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
         controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
+
+    # ip-adapter
+    image_proj_model = ImageProjModel(
+        cross_attention_dim=unet.config.cross_attention_dim,
+        clip_embeddings_dim=image_encoder.config.projection_dim,
+        clip_extra_context_tokens=4,
+    )
+    # init adapter modules
+    attn_procs = {}
+    unet_sd = unet.state_dict()
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = (
+            None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        )
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+        if cross_attention_dim is None:
+            attn_procs[name] = AttnProcessor()
+        else:
+            layer_name = name.split(".processor")[0]
+            weights = {
+                "to_k_ip.weight": unet_sd[layer_name + ".to_k.weight"],
+                "to_v_ip.weight": unet_sd[layer_name + ".to_v.weight"],
+            }
+            attn_procs[name] = IPAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+            )
+            attn_procs[name].load_state_dict(weights)
+    unet.set_attn_processor(attn_procs)
+    adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
+
+    ip_adapter = IPAdapter(
+        unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path
+    )
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -862,7 +1044,10 @@ def main(args):
                     weights.pop()
                     model = models[i]
 
-                    sub_dir = "controlnet"
+                    if isinstance(model, ControlNetModel):
+                        sub_dir = "controlnet"
+                    elif isinstance(model, IPAdapter):
+                        sub_dir = "ip_adapter"
                     model.save_pretrained(os.path.join(output_dir, sub_dir))
 
                     i -= 1
@@ -872,12 +1057,19 @@ def main(args):
                 # pop models so that they are not loaded again
                 model = models.pop()
 
-                # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
-                model.register_to_config(**load_model.config)
+                if isinstance(model, ControlNetModel):
+                    # load diffusers style into model
+                    load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                    model.register_to_config(**load_model.config)
 
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
+                elif isinstance(model, IPAdapter):
+                    state_dict = torch.load(
+                        os.path.join(input_dir, "ip_adapter", "ip_adapter.bin")
+                    )
+                    model.image_proj_model.load_state_dict(state_dict['image_proj'])
+                    model.adapter_modules.load_state_dict(state_dict['ip_adapter'])
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -885,6 +1077,7 @@ def main(args):
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    image_encoder.requires_grad_(False)
     controlnet.train()
 
     if args.enable_xformers_memory_efficient_attention:
@@ -942,7 +1135,11 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = controlnet.parameters()
+    params_to_optimize = itertools.chain(
+        controlnet.parameters(),
+        ip_adapter.image_proj_model.parameters(),
+        ip_adapter.adapter_modules.parameters(),
+    )
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -980,8 +1177,8 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, optimizer, train_dataloader, lr_scheduler
+    controlnet, ip_adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        controlnet, ip_adapter, optimizer, train_dataloader, lr_scheduler
     )
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -996,6 +1193,7 @@ def main(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -1073,12 +1271,13 @@ def main(args):
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(controlnet):
+            with accelerator.accumulate(controlnet, ip_adapter):
                 # Convert images to latent space
-                latents = vae.encode(
-                    batch["pixel_values"].to(dtype=weight_dtype)
-                ).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                with torch.no_grad():
+                    latents = vae.encode(
+                        batch["pixel_values"].to(dtype=weight_dtype)
+                    ).latent_dist.sample()
+                    latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -1106,16 +1305,21 @@ def main(args):
                     return_dict=False,
                 )
 
+                with torch.no_grad():
+                    image_embeds = image_encoder(
+                        batch["clip_images"].to(accelerator.device, dtype=weight_dtype)
+                    ).image_embeds
+
                 # Predict the noise residual
-                model_pred = unet(
+                model_pred = ip_adapter(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-                ).sample
+                    encoder_hidden_states,
+                    image_embeds,
+                    down_block_res_samples,
+                    mid_block_res_sample,
+                    weight_dtype,
+                )
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1126,7 +1330,19 @@ def main(args):
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss_noise = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                # alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+                # alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
+                # beta_prod_t = 1 - alpha_prod_t
+                # pred_x0 = (noisy_latents - beta_prod_t**0.5 * model_pred) / alpha_prod_t**0.5
+                # loss_x0 = F.l1_loss(pred_x0.float(), latents.float(), reduction="none")
+                # # weight为timesteps从1000到0映射到1到e的log函数
+                # weight_loss_x0 = torch.log((1000 - timesteps) / 1000 * (torch.e - 1) + 1)
+                # loss_x0 = torch.mean(weight_loss_x0[:, None, None, None] * loss_x0)
+
+                # loss = loss_noise + loss_x0
+                loss = loss_noise
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1181,13 +1397,19 @@ def main(args):
                             tokenizer,
                             unet,
                             controlnet,
+                            image_encoder,
                             args,
                             accelerator,
                             weight_dtype,
                             global_step,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                'loss_noise': loss_noise.detach().item(),
+                # 'loss_x0': loss_x0.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -1198,7 +1420,9 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         controlnet = accelerator.unwrap_model(controlnet)
+        ip_adapter = accelerator.unwrap_model(ip_adapter)
         controlnet.save_pretrained(args.output_dir)
+        ip_adapter.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
             save_model_card(
