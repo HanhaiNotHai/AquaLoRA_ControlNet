@@ -1,4 +1,4 @@
-accelerate launch --mixed_precision="fp16" train_controlnet.py \
+accelerate launch --mixed_precision="fp16" train_controlnet_aqua.py \
  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
  --output_dir="output4" \
  --train_batch_size=16 \
@@ -17,4 +17,4 @@ accelerate launch --mixed_precision="fp16" train_controlnet.py \
  --validation_steps=500 \
  --rank=320 \
  --msg_bits=48 \
- >train_controlnet.log 2>&1
+ >train_controlnet_aqua.log 2>&1
