@@ -1126,7 +1126,8 @@ def main(args):
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = loss_mse
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1187,7 +1188,11 @@ def main(args):
                             global_step,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "lr": lr_scheduler.get_last_lr()[0],
+                "loss": loss.detach().item(),
+                "loss_mse": loss_mse.detach().item(),
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
