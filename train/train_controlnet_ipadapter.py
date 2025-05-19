@@ -393,10 +393,16 @@ def parse_args(input_args=None):
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--learning_rate",
+        "--learning_rate_controlnet",
         type=float,
-        default=5e-6,
-        help="Initial learning rate (after the potential warmup period) to use.",
+        default=1e-5,
+        help="Initial ControlNet learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--learning_rate_ip_adapter",
+        type=float,
+        default=1e-4,
+        help="Initial IP-Adapter learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
         "--scale_lr",
@@ -1114,8 +1120,14 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
 
     if args.scale_lr:
-        args.learning_rate = (
-            args.learning_rate
+        args.learning_rate_controlnet = (
+            args.learning_rate_controlnet
+            * args.gradient_accumulation_steps
+            * args.train_batch_size
+            * accelerator.num_processes
+        )
+        args.learning_rate_ip_adapter = (
+            args.learning_rate_ip_adapter
             * args.gradient_accumulation_steps
             * args.train_batch_size
             * accelerator.num_processes
@@ -1135,14 +1147,20 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = itertools.chain(
-        controlnet.parameters(),
-        ip_adapter.image_proj_model.parameters(),
-        ip_adapter.adapter_modules.parameters(),
-    )
     optimizer = optimizer_class(
-        params_to_optimize,
-        lr=args.learning_rate,
+        [
+            {
+                "params": controlnet.parameters(),
+                "lr": args.learning_rate_controlnet,
+            },
+            {
+                "params": itertools.chain(
+                    ip_adapter.image_proj_model.parameters(),
+                    ip_adapter.adapter_modules.parameters(),
+                ),
+                "lr": args.learning_rate_ip_adapter,
+            },
+        ],
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
@@ -1330,19 +1348,8 @@ def main(args):
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-                loss_noise = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                # alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
-                # alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
-                # beta_prod_t = 1 - alpha_prod_t
-                # pred_x0 = (noisy_latents - beta_prod_t**0.5 * model_pred) / alpha_prod_t**0.5
-                # loss_x0 = F.l1_loss(pred_x0.float(), latents.float(), reduction="none")
-                # # weight为timesteps从1000到0映射到1到e的log函数
-                # weight_loss_x0 = torch.log((1000 - timesteps) / 1000 * (torch.e - 1) + 1)
-                # loss_x0 = torch.mean(weight_loss_x0[:, None, None, None] * loss_x0)
-
-                # loss = loss_noise + loss_x0
-                loss = loss_noise
+                loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = loss_mse
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1404,11 +1411,12 @@ def main(args):
                             global_step,
                         )
 
+            lr_controlnet, lr_ip_adapter = lr_scheduler.get_last_lr()
             logs = {
+                "lr_controlnet": lr_controlnet,
+                "lr_ip_adapter": lr_ip_adapter,
                 "loss": loss.detach().item(),
-                'loss_noise': loss_noise.detach().item(),
-                # 'loss_x0': loss_x0.detach().item(),
-                "lr": lr_scheduler.get_last_lr()[0],
+                'loss_mse': loss_mse.detach().item(),
             }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
