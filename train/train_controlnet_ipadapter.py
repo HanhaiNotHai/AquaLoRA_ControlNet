@@ -705,37 +705,22 @@ def make_train_dataset(args, tokenizer, accelerator):
         )
         return inputs.input_ids
 
-    image_transforms = transforms.Compose(
+    conditioning_image_transforms = transforms.Compose(
         [
-            transforms.Resize(
-                args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
-            ),
+            transforms.Resize(args.resolution),
             transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
         ]
     )
 
-    conditioning_image_transforms = transforms.Compose(
-        [
-            transforms.Resize(
-                args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
-            ),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
+    normalize = transforms.Normalize([0.5], [0.5])
 
     clip_image_processor = CLIPImageProcessor()
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
-
-        conditioning_images = [image.convert("RGB") for image in examples[image_column]]
-        conditioning_images = [
-            conditioning_image_transforms(image) for image in conditioning_images
-        ]
+        raw_images = [image.convert("RGB") for image in examples[image_column]]
+        conditioning_images = [conditioning_image_transforms(image) for image in raw_images]
+        images = [normalize(image) for image in conditioning_images]
 
         clip_images = [
             clip_image_processor(images=image, return_tensors="pt").pixel_values
