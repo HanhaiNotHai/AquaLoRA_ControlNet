@@ -84,43 +84,8 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def log_validation(
-    vae,
-    text_encoder,
-    tokenizer,
-    unet,
-    controlnet,
-    image_encoder,
-    args,
-    accelerator,
-    weight_dtype,
-    step,
-):
+def log_validation(pipeline, args, accelerator, step):
     logger.info("Running validation... ")
-
-    controlnet = accelerator.unwrap_model(controlnet)
-
-    pipeline: StableDiffusionControlNetPipeline = (
-        StableDiffusionControlNetPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            unet=unet,
-            controlnet=controlnet,
-            safety_checker=None,
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=weight_dtype,
-        )
-    )
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline.image_encoder = image_encoder
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
 
     if args.seed is None:
         generator = None
@@ -849,8 +814,6 @@ class IPAdapter(torch.nn.Module):
         mid_block_res_sample,
         weight_dtype,
     ):
-        # ip_tokens = self.image_proj_model(image_embeds)
-        # encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
         down_block_additional_residuals = [
             sample.to(dtype=weight_dtype) for sample in down_block_res_samples
         ]
@@ -989,7 +952,6 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
-
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
 
     if args.controlnet_model_name_or_path:
@@ -1238,6 +1200,27 @@ def main(args):
         args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     )
 
+    pipeline: StableDiffusionControlNetPipeline = (
+        StableDiffusionControlNetPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            controlnet=controlnet,
+            safety_checker=None,
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=weight_dtype,
+        )
+    )
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline.image_encoder = image_encoder
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
@@ -1353,7 +1336,11 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = controlnet.parameters()
+                    params_to_clip = itertools.chain(
+                        controlnet.parameters(),
+                        ip_adapter.image_proj_model.parameters(),
+                        ip_adapter.adapter_modules.parameters(),
+                    )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -1398,18 +1385,7 @@ def main(args):
                         args.validation_prompt is not None
                         and global_step % args.validation_steps == 0
                     ):
-                        image_logs = log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            unet,
-                            controlnet,
-                            image_encoder,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                        )
+                        image_logs = log_validation(pipeline, args, accelerator, global_step)
 
             lr_controlnet, lr_ip_adapter = lr_scheduler.get_last_lr()
             logs = {
