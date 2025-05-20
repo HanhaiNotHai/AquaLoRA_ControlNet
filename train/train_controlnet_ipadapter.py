@@ -20,6 +20,7 @@ import math
 import os
 import random
 import shutil
+import time
 from pathlib import Path
 
 import accelerate
@@ -287,7 +288,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="controlnet-model",
+        default="controlnet-ipadapter-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -597,6 +598,8 @@ def parse_args(input_args=None):
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
+
+    args.output_dir = os.path.join(args.output_dir, time.strftime(f'%Y%m%d_%H:%M:%S'))
 
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
