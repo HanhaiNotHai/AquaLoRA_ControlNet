@@ -1,3 +1,5 @@
+export id=0
+export CUDA_VISIBLE_DEVICES=$id
 accelerate launch --mixed_precision="fp16" train_controlnet_ipadapter.py \
  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
  --image_encoder_path="laion/CLIP-ViT-H-14-laion2B-s32B-b79K" \
@@ -16,4 +18,4 @@ accelerate launch --mixed_precision="fp16" train_controlnet_ipadapter.py \
  --validation_image "COCO2017test/000000000071.jpg" "COCO2017test/000000000074.jpg" \
  --num_validation_images=4 \
  --validation_steps=500 \
- >train_controlnet_ipadapter.log 2>&1
+ >train_controlnet_ipadapter_$id.log 2>&1
