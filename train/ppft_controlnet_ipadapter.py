@@ -1,6 +1,7 @@
 # Modified from Huggingface's diffusers repo
 
 import sys
+import time
 
 sys.path.append("../")
 
@@ -615,6 +616,8 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
+    args.output_dir = os.path.join(args.output_dir, time.strftime(f'%Y%m%d_%H:%M:%S'))
+
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -775,8 +778,6 @@ def main(args):
     unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
-    # ip_sd = torch.load(args.ip_ckpt)
-    # unet._load_ip_adapter_weights(ip_sd, _remove_lora=True)
 
     pretrain_dict = torch.load(args.start_from_pretrain)
     sec_encoder = SecretEncoder(secret_len=args.msg_bits, resolution=64)
