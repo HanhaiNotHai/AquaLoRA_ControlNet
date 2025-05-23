@@ -7,8 +7,8 @@ accelerate launch --mixed_precision="fp16" train_controlnet_ipadapter.py \
  --train_batch_size=24 \
  --num_train_epochs=30 \
  --checkpointing_steps=500 \
- --learning_rate_controlnet=1e-4 \
- --learning_rate_ip_adapter=1e-3 \
+ --learning_rate_controlnet=1e-5 \
+ --learning_rate_ip_adapter=1e-4 \
  --lr_scheduler="cosine_with_restarts" \
  --lr_warmup_steps=0 \
  --report_to="wandb" \
@@ -16,6 +16,6 @@ accelerate launch --mixed_precision="fp16" train_controlnet_ipadapter.py \
  --proportion_empty_prompts=1 \
  --validation_prompt "" \
  --validation_image "COCO2017test/000000000071.jpg" "COCO2017test/000000000074.jpg" \
- --num_validation_images=4 \
+ --num_validation_images=5 \
  --validation_steps=500 \
  >train_controlnet_ipadapter_$id.log 2>&1

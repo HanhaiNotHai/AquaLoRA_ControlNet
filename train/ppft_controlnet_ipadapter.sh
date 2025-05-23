@@ -9,12 +9,12 @@ accelerate launch --mixed_precision="fp16" ppft_controlnet_ipadapter.py \
  --proportion_empty_prompts=1 \
  --validation_prompt "" \
  --validation_image "COCO2017test/000000000071.jpg" "COCO2017test/000000000074.jpg" \
- --num_validation_images=4 \
+ --num_validation_images=5 \
  --validation_steps=500 \
  --output_dir="output_ppft_controlnet_ipadapter" \
  --seed=2048 \
  --num_train_epochs=30 \
- --train_batch_size=24 \
+ --train_batch_size=20 \
  --checkpointing_steps=500 \
  --start_from_pretrain="../AquaLoRA-Models/pretrained_latent_watermark/pretained_latentwm.pth" \
  --learning_rate=1e-4 \
