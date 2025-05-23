@@ -1258,6 +1258,7 @@ def main(args):
     )
 
     image_logs = None
+    alpha_bar = noise_scheduler.alphas_cumprod.to(accelerator.device)
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet, ip_adapter):
@@ -1319,8 +1320,12 @@ def main(args):
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-                loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                loss = loss_mse
+                loss_smooth_l1 = F.smooth_l1_loss(
+                    model_pred.float(), target.float(), reduction='none'
+                )
+                snr = alpha_bar[timesteps] / (1 - alpha_bar[timesteps])
+                weight = torch.minimum((snr + 1) / snr, torch.tensor(5))
+                loss = (weight[:, None, None, None] * loss_smooth_l1).mean()
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1377,10 +1382,10 @@ def main(args):
 
             lr_controlnet, lr_ip_adapter = lr_scheduler.get_last_lr()
             logs = {
-                "lr_controlnet": lr_controlnet,
-                "lr_ip_adapter": lr_ip_adapter,
-                "loss": loss.detach().item(),
-                'loss_mse': loss_mse.detach().item(),
+                'lr_controlnet': lr_controlnet,
+                'lr_ip_adapter': lr_ip_adapter,
+                'loss': loss.detach().item(),
+                'loss_smooth_l1': loss_smooth_l1.mean().detach().item(),
             }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
