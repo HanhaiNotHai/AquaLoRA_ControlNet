@@ -1212,12 +1212,12 @@ def main(args):
             unet=unet,
             controlnet=controlnet,
             safety_checker=None,
+            image_encoder=image_encoder,
             revision=args.revision,
             torch_dtype=weight_dtype,
         )
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline.image_encoder = image_encoder
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
     if args.enable_xformers_memory_efficient_attention:
