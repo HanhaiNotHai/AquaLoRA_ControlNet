@@ -1,7 +1,6 @@
 # Modified from Huggingface's diffusers repo
 
 import sys
-import time
 
 sys.path.append("../")
 
@@ -14,6 +13,7 @@ import math
 import os
 import random
 import shutil
+import time
 import types
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,7 +32,6 @@ from diffusers import (
     AutoencoderKL,
     ControlNetModel,
     StableDiffusionControlNetPipeline,
-    UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
 from diffusers.models.lora import (
@@ -56,6 +55,7 @@ from transformers import (
 )
 
 from utils.cschedulers import customDDPMScheduler
+from utils.custom_diffusers import CustomUNet2DConditionModel
 from utils.lora_modules import (
     CustomLoRACompatibleConvforward,
     CustomLoRACompatibleLinearforward,
@@ -775,9 +775,11 @@ def main(args):
 
     controlnet = ControlNetModel.from_pretrained(args.controlnet_path)
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
-    unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
+    unet: CustomUNet2DConditionModel = CustomUNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
+    ip_sd = torch.load(args.ip_ckpt)
+    unet.custom_load_ip_adapter_weights(ip_sd)
 
     pretrain_dict = torch.load(args.start_from_pretrain)
     sec_encoder = SecretEncoder(secret_len=args.msg_bits, resolution=64)
@@ -929,9 +931,6 @@ def main(args):
                 module.lora_layer.forward = types.MethodType(
                     CustomLoRALinearLayerforward, module.lora_layer
                 )
-
-    ip_sd = torch.load(args.ip_ckpt)
-    unet._load_ip_adapter_weights(ip_sd, _remove_lora=True)
 
     # The text encoder comes from 🤗 transformers, so we cannot directly modify it.
     # So, instead, we monkey-patch the forward calls of its attention-blocks.
