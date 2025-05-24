@@ -3,12 +3,10 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 from diffusers import UNet2DConditionModel
-from diffusers.models.attention_processor import (
-    AttentionProcessor,
-    IPAdapterAttnProcessor,
-    IPAdapterAttnProcessor2_0,
-)
+from diffusers.models.attention_processor import AttentionProcessor
 from diffusers.models.embeddings import ImageProjection
+from diffusers.models.lora import LoRACompatibleLinear
+from torch import nn
 
 
 class CustomUNet2DConditionLoadersMixin:
@@ -116,7 +114,22 @@ class CustomUNet2DConditionModel(UNet2DConditionModel, CustomUNet2DConditionLoad
         return processors
 
 
-class CustomIPAdapterAttnProcessor(IPAdapterAttnProcessor):
+class CustomIPAdapterAttnProcessor(nn.Module):
+
+    def __init__(self, hidden_size, cross_attention_dim=None, num_tokens=4, scale=1.0):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.num_tokens = num_tokens
+        self.scale = scale
+
+        self.to_k_ip = LoRACompatibleLinear(
+            cross_attention_dim or hidden_size, hidden_size, bias=False
+        )
+        self.to_v_ip = LoRACompatibleLinear(
+            cross_attention_dim or hidden_size, hidden_size, bias=False
+        )
 
     def __call__(
         self,
@@ -202,7 +215,27 @@ class CustomIPAdapterAttnProcessor(IPAdapterAttnProcessor):
         return hidden_states
 
 
-class CustomIPAdapterAttnProcessor2_0(IPAdapterAttnProcessor2_0):
+class CustomIPAdapterAttnProcessor2_0(nn.Module):
+
+    def __init__(self, hidden_size, cross_attention_dim=None, num_tokens=4, scale=1.0):
+        super().__init__()
+
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                f"{self.__class__.__name__} requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
+            )
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.num_tokens = num_tokens
+        self.scale = scale
+
+        self.to_k_ip = LoRACompatibleLinear(
+            cross_attention_dim or hidden_size, hidden_size, bias=False
+        )
+        self.to_v_ip = LoRACompatibleLinear(
+            cross_attention_dim or hidden_size, hidden_size, bias=False
+        )
 
     def __call__(
         self,
